@@ -6,6 +6,23 @@ The file is opened with Node's built-in `node:sqlite` module. Write-ahead loggin
 
 Tables are created by `lib/db.js` at startup if they do not exist yet.
 
+## What SQLite is and how the shop uses it
+
+SQLite is a database that lives in a single file. Unlike MySQL or PostgreSQL, there is no separate database server to install, start or log in to. The shop's own process reads and writes the file directly.
+
+- **No install needed.** Node.js 22.13 and newer has SQLite built in, which is why the project has no packages.
+- **Created automatically.** `lib/db.js` opens the file at startup, creates the tables if they are missing, adds the default settings, and adds 8 starter products when the shop is empty.
+- **Queried with plain SQL.** `server.js` runs prepared statements, as in the example below. The `?` placeholders keep user input out of the SQL text, which prevents SQL injection.
+- **Changes that belong together are grouped.** Saving an order and its lines happens inside one transaction, using the `tx` helper in `lib/db.js`. If any step fails, nothing is saved.
+- **Not uploaded to GitHub.** The `data` folder is listed in `.gitignore`, so customer data stays on the machine that runs the shop.
+
+```
+const order = db.prepare("SELECT * FROM orders WHERE order_no = ?").get("AM1001");
+const items = db.prepare("SELECT * FROM order_items WHERE order_id = ?").all(order.id);
+```
+
+`.get()` returns one row, `.all()` returns a list of rows, and `.run()` is used for inserts, updates and deletes.
+
 ## Tables
 
 | Table | Holds |
@@ -16,6 +33,29 @@ Tables are created by `lib/db.js` at startup if they do not exist yet.
 | `order_items` | The lines of each order |
 | `payment_log` | Every notification received from PayHere |
 | `settings` | Store settings as name and value pairs |
+
+## How the tables relate
+
+| Relationship | Type | What happens on delete |
+|---|---|---|
+| `products` to `images` | One product has many photos | Deleting a product deletes its photos |
+| `orders` to `order_items` | One order has many lines | Deleting an order deletes its lines |
+| `order_items` to `products` | A line records which product was bought, without a database link | Deleting a product leaves past order lines unchanged |
+| `payment_log` to `orders` | A log entry holds the order number as text, without a database link | Log entries are kept |
+
+`settings` stands alone.
+
+## Design choices
+
+- **Money is whole rupees.** Prices and totals are integers, which avoids decimal rounding errors.
+- **Colours and sizes are JSON text.** A product's colours, for example `[["Deep Plum","#4A1F5C"]]`, sit in one column instead of in separate tables. This keeps the schema small, at the cost of not being able to search by colour in SQL.
+- **Photos are stored in the database.** A backup of the one file therefore includes every photo.
+- **Order lines copy the product's name and price.** Past orders stay correct after a product is edited or deleted.
+- **Order numbers come from the row ID.** `AM` followed by 1000 plus the ID.
+- **Dates are UTC text**, in the form `2026-10-02 05:10:44`.
+- **Categories, sizes and statuses are not tables.** The allowed values are lists in `server.js`, checked before anything is saved.
+
+## Table details
 
 ### products
 
