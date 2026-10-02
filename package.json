@@ -1,0 +1,14 @@
+{
+  "name": "amethia-shop",
+  "version": "1.0.0",
+  "description": "Amethia clothing store: storefront, admin panel and PayHere payments. No external packages needed.",
+  "main": "server.js",
+  "private": true,
+  "scripts": {
+    "start": "node --no-warnings=ExperimentalWarning server.js",
+    "dev": "node --no-warnings=ExperimentalWarning --watch server.js"
+  },
+  "engines": {
+    "node": ">=22.13.0"
+  }
+}

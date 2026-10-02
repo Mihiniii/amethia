@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Amethia</title>
+<meta name="description" content="Amethia: clothing designed in Sri Lanka and made to order in small runs.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bodoni+Moda:ital,opsz,wght@0,6..96,400;0,6..96,500;1,6..96,400&family=Jost:wght@300;400;500&display=swap">
+<link rel="stylesheet" href="/shop.css">
+</head>
+<body>
+
+<div class="announce" id="announce">Island-wide delivery · Cash on delivery</div>
+
+<header class="site">
+  <div class="wrap hdr">
+    <div style="display:flex;align-items:center;gap:8px">
+      <button class="iconbtn menubtn" id="menubtn" aria-expanded="false" aria-controls="mainnav" aria-label="Menu">
+        <svg viewBox="0 0 24 24"><path d="M3 7h18M3 12h18M3 17h18"/></svg>
+      </button>
+      <ul class="mainnav" id="mainnav">
+        <li><a href="/#shop" data-nav="shop">Shop all</a></li>
+        <li><a href="/#shop-dresses" data-nav="shop-dresses">Dresses</a></li>
+        <li><a href="/#about" data-nav="about">Our story</a></li>
+        <li><a href="/#help" data-nav="help">Help</a></li>
+      </ul>
+    </div>
+    <a class="logo" href="/#home">Amethia<span>.</span></a>
+    <div class="hdr-right">
+      <button class="iconbtn" data-action="open-bag" aria-label="Open shopping bag">
+        <svg viewBox="0 0 24 24"><path d="M5 8h14l-1 13H6L5 8z"/><path d="M9 8V6a3 3 0 0 1 6 0v2"/></svg>
+        <span class="bagword">Bag</span><span class="count" id="bagcount" aria-live="polite">0</span>
+      </button>
+    </div>
+  </div>
+</header>
+
+<main id="app"><div class="loading">Loading the shop…</div></main>
+
+<footer class="site">
+  <div class="wrap fgrid">
+    <div class="fbrand">
+      <a class="logo" href="/#home">Amethia<span>.</span></a>
+      <p>Clothing designed in Sri Lanka and made to order in small runs. Every piece starts as a sketch.</p>
+    </div>
+    <div><h4>Shop</h4><ul>
+      <li><a href="/#shop">Shop all</a></li>
+      <li><a href="/#shop-dresses">Dresses</a></li>
+      <li><a href="/#shop-tops">Tops</a></li>
+      <li><a href="/#shop-bottoms">Skirts &amp; pants</a></li>
+      <li><a href="/#shop-coords">Co-ord sets</a></li>
+    </ul></div>
+    <div><h4>Help</h4><ul>
+      <li><a href="/#help">Size guide</a></li>
+      <li><a href="/#help">Delivery &amp; exchanges</a></li>
+      <li><a href="/#help">FAQ</a></li>
+      <li><a href="/#help">Contact us</a></li>
+    </ul></div>
+    <div><h4>Follow</h4><ul>
+      <li><a class="js-ig" href="#">Instagram</a></li>
+      <li><a class="js-fb" href="#">Facebook</a></li>
+      <li><a class="js-tt" href="#">TikTok</a></li>
+    </ul></div>
+  </div>
+  <div class="wrap fbottom">
+    <span>© <span id="year">2026</span> Amethia. All rights reserved.</span>
+    <span>Secure card payments by PayHere · Prices in LKR</span>
+  </div>
+</footer>
+
+<div class="scrim" id="scrim" hidden data-action="close-bag"></div>
+<aside class="drawer" id="drawer" hidden aria-label="Shopping bag" role="dialog" aria-modal="true">
+  <div class="dr-head"><h2 id="drtitle">Your bag</h2><button class="iconbtn" data-action="close-bag" aria-label="Close bag"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg></button></div>
+  <div class="dr-body" id="drbody"></div>
+  <div class="dr-foot" id="drfoot"></div>
+</aside>
+
+<script src="/garments.js"></script>
+<script src="/shop.js"></script>
+</body>
+</html>
