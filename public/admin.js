@@ -160,12 +160,12 @@ async function productsView() {
     <button class="pitem" data-action="edit-product" data-id="${esc(p.id)}">
       <div class="pimg">${pic(p)}</div>
       <div class="pi"><h3>${esc(p.name)}</h3><span class="muted">${lkr(p.price)} · ${CAT_NAMES[p.category]}</span>
-        <span style="display:flex;gap:6px;flex-wrap:wrap">${p.active ? `<span class="pill good">On sale</span>` : `<span class="pill mute">Hidden</span>`}${p.soldOut ? `<span class="pill bad">Sold out</span>` : ""}${p.badge === "Sample" ? `<span class="pill warn">Sample</span>` : ""}</span></div>
+        <span style="display:flex;gap:6px;flex-wrap:wrap">${p.active ? `<span class="pill good">On sale</span>` : `<span class="pill mute">Hidden</span>`}${p.soldOut ? `<span class="pill bad">Sold out</span>` : Object.values(p.stock).some(n => n === 0) ? `<span class="pill warn">Some sizes sold out</span>` : ""}${p.badge === "Sample" ? `<span class="pill warn">Sample</span>` : ""}</span></div>
     </button>`).join("")}</div>`;
 }
 let editing = null, delArmed = false;
 function editProduct(id) {
-  const p = id ? PDATA.products.find(x => x.id === id) : { id: "", name: "", category: "dresses", type: "dress", price: "", badge: "", intro: "", description: "", fabric: "", colors: [["", "#6A2C91"]], sizes: ["XS", "S", "M", "L", "XL"], active: true, soldOut: false, sort: PDATA.products.length, images: [] };
+  const p = id ? PDATA.products.find(x => x.id === id) : { id: "", name: "", category: "dresses", type: "dress", price: "", badge: "", intro: "", description: "", fabric: "", colors: [["", "#6A2C91"]], sizes: ["XS", "S", "M", "L", "XL"], stock: {}, active: true, markedSoldOut: false, sort: PDATA.products.length, images: [] };
   editing = JSON.parse(JSON.stringify(p)); editing.isNew = !id; delArmed = false;
   renderProductForm();
 }
@@ -193,11 +193,13 @@ function renderProductForm(err = "") {
           <div class="colorrow"><input type="text" id="c-name-${i}" value="${esc(c[0])}" placeholder="Colour name" aria-label="Colour name"><input type="color" id="c-hex-${i}" value="${esc(c[1])}" aria-label="Colour"><button type="button" class="small danger" data-action="rm-color" data-i="${i}" ${p.colors.length === 1 ? "disabled" : ""}>Remove</button></div>`).join("")}</div>
         <button type="button" class="small" style="justify-self:start" data-action="add-color" ${p.colors.length >= 8 ? "disabled" : ""}>+ Add colour</button>
       </div>
-      <div class="field"><span class="optlabel">Sizes available</span>
-        <div class="checks">${PDATA.sizes.map(s => `<label><input type="checkbox" name="size" value="${s}" ${p.sizes.includes(s) ? "checked" : ""}> ${s}</label>`).join("")}</div></div>
+      <div class="field"><span class="optlabel">Sizes available and stock</span>
+        <div class="checks">${PDATA.sizes.map(s => `<label class="stockrow"><input type="checkbox" name="size" value="${s}" ${p.sizes.includes(s) ? "checked" : ""}> ${s}
+          <input type="number" class="stockin" id="${stockId(s)}" min="0" step="1" value="${esc(p.stock[s] ?? "")}" placeholder="No limit" aria-label="Pieces in stock, size ${s}"></label>`).join("")}</div>
+        <span class="muted" style="font-size:13px">Pieces in stock for each size, counted across all colours. Leave blank for made-to-order sizes with no limit. Orders take pieces out automatically; cancelling an order puts them back.</span></div>
       <div class="checks">
         <label><input type="checkbox" id="p-active" ${p.active ? "checked" : ""}> Show in shop</label>
-        <label><input type="checkbox" id="p-sold" ${p.soldOut ? "checked" : ""}> Sold out</label>
+        <label><input type="checkbox" id="p-sold" ${p.markedSoldOut ? "checked" : ""}> Sold out (all sizes)</label>
       </div>
       <div class="field" style="max-width:200px"><label for="p-sort">Position in shop</label><input type="number" id="p-sort" step="1" value="${esc(p.sort)}"><span class="muted" style="font-size:13px">Lower numbers show first.</span></div>
       ${err ? `<p class="alert" role="alert">${esc(err)}</p>` : ""}
@@ -226,8 +228,10 @@ function readForm() {
   editing.intro = $("#p-intro").value; editing.description = $("#p-desc").value; editing.fabric = $("#p-fabric").value;
   editing.colors = Array.from({ length: n }, (_, i) => [$("#c-name-" + i).value.trim(), $("#c-hex-" + i).value]);
   editing.sizes = [...document.querySelectorAll('input[name="size"]:checked')].map(i => i.value);
-  editing.active = $("#p-active").checked; editing.soldOut = $("#p-sold").checked; editing.sort = $("#p-sort").value;
+  editing.stock = Object.fromEntries(PDATA.sizes.map(s => [s, $("#" + stockId(s)).value.trim()]).filter(([, v]) => v !== ""));
+  editing.active = $("#p-active").checked; editing.markedSoldOut = $("#p-sold").checked; editing.sort = $("#p-sort").value;
 }
+const stockId = s => "st-" + s.replace(/\W/g, "");
 async function saveProduct() {
   readForm();
   const body = { ...editing, price: Number(editing.price), sort: Number(editing.sort) || 0 };

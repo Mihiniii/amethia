@@ -49,7 +49,14 @@ function readBody(req, limit) {
 async function jsonBody(req, limit = 100_000) {
   if (!(req.headers["content-type"] || "").includes("application/json")) fail(415, "Expected JSON.");
   const raw = await readBody(req, limit);
-  try { return raw ? JSON.parse(raw) : {}; } catch { fail(400, "Invalid JSON."); }
+  let body;
+  try { body = raw ? JSON.parse(raw) : {}; } catch { fail(400, "Invalid JSON."); }
+  if (!body || typeof body !== "object" || Array.isArray(body)) fail(400, "Invalid JSON.");
+  return body;
+}
+// decodeURIComponent throws on broken input like "%E0%A4%A"; treat that as a bad request, not a server error.
+function decode(s) {
+  try { return decodeURIComponent(s); } catch { fail(400, "Bad request."); }
 }
 async function formBody(req) {
   const raw = await readBody(req, 50_000);
@@ -75,11 +82,14 @@ const safeEqual = (a, b) => {
 };
 
 function productRow(r, withImages = true) {
+  const sizes = JSON.parse(r.sizes), all = parseStock(r.stock);
+  const stock = Object.fromEntries(sizes.filter(s => s in all).map(s => [s, Math.max(0, Number(all[s]) || 0)]));
+  const noneLeft = sizes.every(s => stock[s] === 0);
   return {
     id: r.id, name: r.name, category: r.category, type: r.type, price: r.price, badge: r.badge,
     intro: r.intro, description: r.description, fabric: r.fabric,
-    colors: JSON.parse(r.colors), sizes: JSON.parse(r.sizes),
-    active: !!r.active, soldOut: !!r.sold_out, sort: r.sort,
+    colors: JSON.parse(r.colors), sizes, stock,
+    active: !!r.active, soldOut: !!r.sold_out || noneLeft, markedSoldOut: !!r.sold_out, sort: r.sort,
     images: withImages ? db.prepare("SELECT id FROM images WHERE product_id = ? ORDER BY sort, id").all(r.id).map(i => i.id) : [],
   };
 }
@@ -98,17 +108,119 @@ function makeSession() {
   const exp = Date.now() + 1000 * 60 * 60 * 12; // 12 hours
   return `${exp}.${sign(String(exp))}`;
 }
+function readCookie(req, name) {
+  for (const part of (req.headers.cookie || "").split(";")) {
+    const eq = part.indexOf("=");
+    if (eq === -1 || part.slice(0, eq).trim() !== name) continue;
+    try { return decodeURIComponent(part.slice(eq + 1).trim()); } catch { return ""; } // broken cookie = not logged in
+  }
+  return "";
+}
 function isAdmin(req) {
-  const c = Object.fromEntries((req.headers.cookie || "").split(";").map(p => p.trim().split("=").map(decodeURIComponent)).filter(p => p[0]));
-  const v = c[COOKIE]; if (!v) return false;
+  const v = readCookie(req, COOKIE); if (!v) return false;
   const [exp, sig] = v.split(".");
-  return Number(exp) > Date.now() && sig && safeEqual(sig, sign(exp));
+  return Number(exp) > Date.now() && !!sig && safeEqual(sig, sign(exp));
 }
 function cookieHeader(value, maxAge) {
   return `${COOKIE}=${value}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${maxAge}${config.secureCookies ? "; Secure" : ""}`;
 }
-const loginAttempts = new Map();
-function clientIp(req) { return (req.headers["x-forwarded-for"] || "").split(",")[0].trim() || req.socket.remoteAddress; }
+
+// The visitor's IP. X-Forwarded-For is only used when a proxy is in front, and then we take the entry
+// our own proxy added (counting from the right). Entries further left come from the visitor and can be
+// anything, so they are never trusted. In "auto" mode a proxy is assumed only when the connection comes
+// from this machine or a private network: visitors on the internet can't connect from those addresses.
+const PRIVATE_ADDR = /^(::ffff:)?(127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)|^::1$|^f[cd][0-9a-f]{2}:/i;
+function clientIp(req) {
+  const remote = req.socket.remoteAddress || "unknown";
+  const hops = config.trustProxy === "auto" ? (PRIVATE_ADDR.test(remote) ? 1 : 0) : config.trustProxy;
+  if (hops > 0) {
+    const chain = String(req.headers["x-forwarded-for"] || "").split(",").map(s => s.trim()).filter(Boolean);
+    if (chain.length >= hops) return chain[chain.length - hops];
+  }
+  return remote;
+}
+
+// Counts events per key (usually an IP). Once a key reaches `max` it stays blocked for `windowMs`.
+function rateLimiter(max, windowMs) {
+  const hits = new Map();
+  setInterval(() => { const now = Date.now(); for (const [k, h] of hits) if (h.reset <= now) hits.delete(k); }, 60_000).unref();
+  return {
+    blocked(key) { const h = hits.get(key); return !!h && h.reset > Date.now() && h.n >= max; },
+    hit(key) {
+      const now = Date.now();
+      let h = hits.get(key);
+      if (!h || h.reset <= now) { h = { n: 0, reset: now + windowMs }; hits.set(key, h); }
+      h.n += 1;
+      if (h.n >= max) h.reset = now + windowMs;
+    },
+    clear(key) { hits.delete(key); },
+  };
+}
+const MINUTE = 60 * 1000;
+const loginFails = rateLimiter(5, 15 * MINUTE);        // per IP
+const loginFailsAll = rateLimiter(100, 15 * MINUTE);   // all IPs together, in case someone uses many addresses
+// Many mobile customers in Sri Lanka share one IP, so the IP limit is generous;
+// the phone-number limit is what stops one person sending lots of fake orders.
+const orderLimit = rateLimiter(15, 15 * MINUTE);       // new orders per IP
+const phoneLimit = rateLimiter(3, 60 * MINUTE);        // new orders per phone number
+const payLimit = rateLimiter(10, 15 * MINUTE);         // "try paying again" per IP
+
+/* ------------------------------------------------------------------ */
+/* stock (per size)                                                   */
+/* ------------------------------------------------------------------ */
+// products.stock is {"S": 3, "M": 0}. A size that isn't listed has no limit (made to order).
+function parseStock(s) {
+  try { const o = JSON.parse(s || "{}"); return o && typeof o === "object" && !Array.isArray(o) ? o : {}; } catch { return {}; }
+}
+// direction -1 takes the items out of stock (fails if there aren't enough), +1 puts them back.
+// force: take what's there instead of failing (for payments that already went through); returns false if short.
+// Call inside tx() so a failure part-way leaves stock unchanged.
+function moveStock(items, direction, force = false) {
+  let enough = true;
+  const need = new Map();
+  for (const i of items) {
+    const k = JSON.stringify([i.product_id, i.size]);
+    need.set(k, { id: i.product_id, size: i.size, qty: (need.has(k) ? need.get(k).qty : 0) + i.qty });
+  }
+  const changed = new Map();
+  for (const n of need.values()) {
+    if (!changed.has(n.id)) {
+      const p = db.prepare("SELECT name, stock FROM products WHERE id = ?").get(n.id);
+      if (!p) continue; // product was deleted; nothing to track
+      changed.set(n.id, { name: p.name, stock: parseStock(p.stock) });
+    }
+    const p = changed.get(n.id);
+    if (!(n.size in p.stock)) continue;
+    const left = Number(p.stock[n.size]) || 0;
+    if (direction < 0 && left < n.qty) {
+      if (!force) fail(409, left === 0 ? `${p.name} in size ${n.size} has just sold out. Please remove it from your bag.`
+        : `Only ${left} left of ${p.name} in size ${n.size}. Please lower the quantity.`);
+      enough = false;
+    }
+    p.stock[n.size] = Math.max(0, left + direction * n.qty);
+  }
+  const up = db.prepare("UPDATE products SET stock = ? WHERE id = ?");
+  for (const [id, p] of changed) up.run(JSON.stringify(p.stock), id);
+  return enough;
+}
+const orderItems = id => db.prepare("SELECT product_id, size, qty FROM order_items WHERE order_id = ?").all(id);
+
+// Card orders hold their pieces while the customer pays. If nothing is paid within 2 hours
+// (PayHere page closed, card declined…), put the pieces back so other customers can buy them.
+// They are taken again if the customer tries paying later, or if a late payment comes in.
+const HOLD_UNPAID = "-2 hours";
+function releaseUnpaidStock() {
+  const stale = db.prepare(`SELECT id, order_no FROM orders WHERE payment_method = 'card' AND payment_status != 'paid'
+                            AND stock_held = 1 AND status != 'cancelled' AND updated_at < datetime('now', ?)`).all(HOLD_UNPAID);
+  for (const o of stale) {
+    tx(() => {
+      moveStock(orderItems(o.id), +1);
+      db.prepare("UPDATE orders SET stock_held = 0 WHERE id = ?").run(o.id);
+    });
+    console.log(`Order ${o.order_no}: not paid after 2 hours, pieces put back in stock`);
+  }
+}
+setInterval(() => { try { releaseUnpaidStock(); } catch (e) { console.error(e); } }, 10 * MINUTE).unref();
 
 /* ------------------------------------------------------------------ */
 /* routes                                                              */
@@ -149,6 +261,8 @@ function publicOrder(o) {
 }
 
 route("POST", "/api/orders", async req => {
+  const ip = clientIp(req);
+  if (orderLimit.blocked(ip)) fail(429, "You've placed several orders in a short time. Please wait 15 minutes, or message us on WhatsApp.");
   const body = await jsonBody(req);
   const s = getSettings();
   const c = body.customer || {};
@@ -165,6 +279,8 @@ route("POST", "/api/orders", async req => {
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(customer.email)) fail(400, "Please enter a valid email address.");
   const digits = customer.phone.replace(/\D/g, "");
   if (digits.length < 9 || digits.length > 15) fail(400, "Please enter a valid phone number.");
+  const phoneKey = digits.slice(-9); // 0771234567 and +94771234567 count as the same number
+  if (phoneLimit.blocked(phoneKey)) fail(429, "Several orders were placed with this phone number in the last hour. Please message us on WhatsApp to add more.");
 
   const method = body.paymentMethod;
   if (method === "card" && !config.payhere.enabled) fail(400, "Card payments aren't available right now. Please choose cash on delivery.");
@@ -175,6 +291,7 @@ route("POST", "/api/orders", async req => {
   if (body.items.length > 30) fail(400, "Too many items in one order.");
   const merged = new Map();
   for (const it of body.items) {
+    if (!it || typeof it !== "object") fail(400, "One of the items in your bag isn't valid. Please remove it and try again.");
     const p = db.prepare("SELECT * FROM products WHERE id = ? AND active = 1").get(String(it.id || ""));
     if (!p) fail(400, "One of the items in your bag is no longer available. Please remove it and try again.");
     if (p.sold_out) fail(400, `${p.name} is sold out. Please remove it from your bag.`);
@@ -193,10 +310,11 @@ route("POST", "/api/orders", async req => {
   const total = subtotal + delivery;
 
   const order = tx(() => {
+    moveStock(items, -1);
     const key = crypto.randomBytes(12).toString("base64url");
     const r = db.prepare(`INSERT INTO orders (access_key, first_name, last_name, email, phone, address, city, district, notes,
-                           payment_method, payment_status, subtotal, delivery, total, pay_attempts)
-                          VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+                           payment_method, payment_status, subtotal, delivery, total, pay_attempts, stock_held)
+                          VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1)`)
       .run(key, customer.first_name, customer.last_name, customer.email, customer.phone, customer.address, customer.city,
         customer.district, customer.notes, method, method === "card" ? "pending" : "unpaid", subtotal, delivery, total, method === "card" ? 1 : 0);
     const id = Number(r.lastInsertRowid);
@@ -206,6 +324,7 @@ route("POST", "/api/orders", async req => {
     for (const i of items) ins.run(id, i.product_id, i.name, i.color, i.size, i.qty, i.unit_price);
     return db.prepare("SELECT * FROM orders WHERE id = ?").get(id);
   });
+  orderLimit.hit(ip); phoneLimit.hit(phoneKey);
 
   console.log(`New order ${order.order_no}: ${method}, LKR ${total}`);
   const out = { orderNo: order.order_no, key: order.access_key, total };
@@ -217,6 +336,9 @@ route("GET", "/api/orders/:no", (req, res, p, url) => publicOrder(loadOrderForCu
 
 // Try paying again after a cancelled or failed card payment.
 route("POST", "/api/orders/:no/pay", async (req, res, p) => {
+  const ip = clientIp(req);
+  if (payLimit.blocked(ip)) fail(429, "Too many payment attempts. Please wait 15 minutes and try again.");
+  payLimit.hit(ip);
   const body = await jsonBody(req);
   const o = loadOrderForCustomer(p.no, body.key);
   if (o.payment_method !== "card") fail(400, "This order is cash on delivery.");
@@ -224,7 +346,10 @@ route("POST", "/api/orders/:no/pay", async (req, res, p) => {
   if (o.status === "cancelled") fail(400, "This order was cancelled.");
   if (!config.payhere.enabled) fail(400, "Card payments aren't available right now.");
   const attempt = o.pay_attempts + 1;
-  db.prepare("UPDATE orders SET pay_attempts = ?, payment_status = 'pending', updated_at = datetime('now') WHERE id = ?").run(attempt, o.id);
+  tx(() => {
+    if (!o.stock_held) moveStock(orderItems(o.id), -1); // pieces were put back while unpaid; take them again
+    db.prepare("UPDATE orders SET pay_attempts = ?, payment_status = 'pending', stock_held = 1, updated_at = datetime('now') WHERE id = ?").run(attempt, o.id);
+  });
   const items = db.prepare("SELECT * FROM order_items WHERE order_id = ?").all(o.id);
   return { payhere: payhere.checkoutFields(o, items, attempt) };
 });
@@ -246,8 +371,20 @@ route("POST", "/api/payhere/notify", async (req, res) => {
   const next = payhere.STATUS[p.status_code] || "pending";
   // Never let a late "cancelled" or "pending" message overwrite a confirmed payment (chargebacks still apply).
   if (o.payment_status === "paid" && next !== "chargeback") return send(res, 200, "OK");
-  db.prepare("UPDATE orders SET payment_status = ?, payment_ref = ?, payment_info = ?, updated_at = datetime('now') WHERE id = ?")
-    .run(next, String(p.payment_id || ""), `${p.method || ""} ${p.status_message || ""}`.trim(), o.id);
+  let info = `${p.method || ""} ${p.status_message || ""}`.trim();
+  tx(() => {
+    let held = o.stock_held;
+    // A payment that arrives after the pieces were put back: the money is in, so take them anyway.
+    if (next === "paid" && !held && o.status !== "cancelled") {
+      if (!moveStock(orderItems(o.id), -1, true)) {
+        info += " · Paid after stock ran out, check stock before making";
+        console.warn(`Order ${orderNo} was paid late and some sizes had run out of stock`);
+      }
+      held = 1;
+    }
+    db.prepare("UPDATE orders SET payment_status = ?, payment_ref = ?, payment_info = ?, stock_held = ?, updated_at = datetime('now') WHERE id = ?")
+      .run(next, String(p.payment_id || ""), info, held, o.id);
+  });
   console.log(`PayHere: order ${orderNo} is now ${next}`);
   send(res, 200, "OK");
 });
@@ -256,15 +393,13 @@ route("POST", "/api/payhere/notify", async (req, res) => {
 route("POST", "/api/admin/login", async (req, res) => {
   if (!config.adminPassword || config.adminPassword === "change-this-password") fail(503, "Set ADMIN_PASSWORD in the .env file first, then restart the server.");
   const ip = clientIp(req);
-  const a = loginAttempts.get(ip) || { n: 0, until: 0 };
-  if (a.until > Date.now()) fail(429, "Too many attempts. Please wait 15 minutes and try again.");
+  if (loginFails.blocked(ip) || loginFailsAll.blocked("all")) fail(429, "Too many attempts. Please wait 15 minutes and try again.");
   const body = await jsonBody(req);
   if (!safeEqual(String(body.password || ""), config.adminPassword)) {
-    a.n += 1; if (a.n >= 5) { a.until = Date.now() + 15 * 60 * 1000; a.n = 0; }
-    loginAttempts.set(ip, a);
+    loginFails.hit(ip); loginFailsAll.hit("all");
     fail(401, "That password isn't right.");
   }
-  loginAttempts.delete(ip);
+  loginFails.clear(ip);
   send(res, 200, { ok: true }, { "Set-Cookie": cookieHeader(makeSession(), 60 * 60 * 12) });
 });
 route("POST", "/api/admin/logout", (req, res) => send(res, 200, { ok: true }, { "Set-Cookie": cookieHeader("", 0) }));
@@ -308,7 +443,13 @@ route("PATCH", "/api/admin/orders/:id", async (req, res, p) => {
   const paymentStatus = body.paymentStatus ?? o.payment_status;
   if (!ORDER_STATUSES.includes(status)) fail(400, "Unknown order status.");
   if (!PAYMENT_STATUSES.includes(paymentStatus)) fail(400, "Unknown payment status.");
-  db.prepare("UPDATE orders SET status = ?, payment_status = ?, updated_at = datetime('now') WHERE id = ?").run(status, paymentStatus, o.id);
+  tx(() => {
+    // Cancelling puts the pieces back in stock; reopening a cancelled order takes them out again.
+    let held = o.stock_held;
+    if (status === "cancelled" && held) { moveStock(orderItems(o.id), +1); held = 0; }
+    else if (status !== "cancelled" && o.status === "cancelled" && !held) { moveStock(orderItems(o.id), -1); held = 1; }
+    db.prepare("UPDATE orders SET status = ?, payment_status = ?, stock_held = ?, updated_at = datetime('now') WHERE id = ?").run(status, paymentStatus, held, o.id);
+  });
   return { ok: true };
 }, { admin: true });
 
@@ -328,6 +469,13 @@ function readProduct(b, existingId) {
   });
   if (new Set(colors.map(c => c[0])).size !== colors.length) fail(400, "Each colour needs a different name.");
   if (!Array.isArray(b.sizes) || !b.sizes.length || !b.sizes.every(s => ALL_SIZES.includes(s))) fail(400, "Choose at least one size.");
+  // Stock per size: blank means no limit (made to order).
+  const rawStock = b.stock && typeof b.stock === "object" && !Array.isArray(b.stock) ? b.stock : {};
+  const stock = {};
+  for (const s of ALL_SIZES) {
+    if (!b.sizes.includes(s) || rawStock[s] === "" || rawStock[s] == null) continue;
+    stock[s] = int(rawStock[s], 0, 100_000, `Stock for size ${s}`);
+  }
   return {
     id, name, category: b.category, type: b.type,
     price: int(b.price, 0, 10_000_000, "Price"),
@@ -337,7 +485,8 @@ function readProduct(b, existingId) {
     fabric: str(b.fabric, 1000, { required: false, label: "Fabric & care" }),
     colors: JSON.stringify(colors),
     sizes: JSON.stringify(ALL_SIZES.filter(s => b.sizes.includes(s))),
-    active: b.active ? 1 : 0, sold_out: b.soldOut ? 1 : 0,
+    stock: JSON.stringify(stock),
+    active: b.active ? 1 : 0, sold_out: b.markedSoldOut ? 1 : 0,
     sort: int(b.sort ?? 0, -10000, 10000, "Order"),
   };
 }
@@ -350,8 +499,8 @@ route("GET", "/api/admin/products", () => ({
 route("POST", "/api/admin/products", async req => {
   const p = readProduct(await jsonBody(req));
   if (db.prepare("SELECT 1 FROM products WHERE id = ?").get(p.id)) fail(400, "Another product already uses that link name.");
-  db.prepare(`INSERT INTO products (id,name,category,type,price,badge,intro,description,fabric,colors,sizes,active,sold_out,sort)
-              VALUES (:id,:name,:category,:type,:price,:badge,:intro,:description,:fabric,:colors,:sizes,:active,:sold_out,:sort)`).run(p);
+  db.prepare(`INSERT INTO products (id,name,category,type,price,badge,intro,description,fabric,colors,sizes,stock,active,sold_out,sort)
+              VALUES (:id,:name,:category,:type,:price,:badge,:intro,:description,:fabric,:colors,:sizes,:stock,:active,:sold_out,:sort)`).run(p);
   return productRow(db.prepare("SELECT * FROM products WHERE id = ?").get(p.id));
 }, { admin: true });
 
@@ -359,7 +508,7 @@ route("PUT", "/api/admin/products/:id", async (req, res, params) => {
   if (!db.prepare("SELECT 1 FROM products WHERE id = ?").get(params.id)) fail(404, "Product not found.");
   const p = readProduct(await jsonBody(req), params.id);
   db.prepare(`UPDATE products SET name=:name, category=:category, type=:type, price=:price, badge=:badge, intro=:intro,
-              description=:description, fabric=:fabric, colors=:colors, sizes=:sizes, active=:active, sold_out=:sold_out, sort=:sort
+              description=:description, fabric=:fabric, colors=:colors, sizes=:sizes, stock=:stock, active=:active, sold_out=:sold_out, sort=:sort
               WHERE id=:id`).run(p);
   return productRow(db.prepare("SELECT * FROM products WHERE id = ?").get(p.id));
 }, { admin: true });
@@ -436,7 +585,7 @@ function serveFile(res, file, extra = {}) {
 function serveStatic(req, res, pathname) {
   if (pathname === "/admin" || pathname === "/admin/") return serveFile(res, path.join(PUBLIC_DIR, "admin.html"), { "X-Frame-Options": "DENY" });
   if (pathname === "/" || pathname.startsWith("/order/")) return serveFile(res, path.join(PUBLIC_DIR, "index.html"));
-  const file = path.normalize(path.join(PUBLIC_DIR, decodeURIComponent(pathname)));
+  const file = path.normalize(path.join(PUBLIC_DIR, decode(pathname)));
   if (!file.startsWith(PUBLIC_DIR + path.sep)) return send(res, 403, "Forbidden");
   fs.stat(file, (err, st) => {
     if (!err && st.isFile()) return serveFile(res, file);
@@ -448,16 +597,17 @@ function serveStatic(req, res, pathname) {
 /* server                                                              */
 /* ------------------------------------------------------------------ */
 const server = http.createServer(async (req, res) => {
-  const url = new URL(req.url, "http://localhost");
-  const pathname = url.pathname;
   try {
+    let url;
+    try { url = new URL(req.url, "http://localhost"); } catch { fail(400, "Bad request."); }
+    const pathname = url.pathname;
     if (pathname.startsWith("/api/")) {
       for (const r of routes) {
         if (r.method !== req.method) continue;
         const m = r.re.exec(pathname);
         if (!m) continue;
         if (r.admin && !isAdmin(req)) fail(401, "Please log in again.");
-        const params = Object.fromEntries(r.keys.map((k, i) => [k, decodeURIComponent(m[i + 1])]));
+        const params = Object.fromEntries(r.keys.map((k, i) => [k, decode(m[i + 1])]));
         const result = await r.handler(req, res, params, url);
         if (!res.headersSent && result !== undefined) send(res, 200, result, { "Cache-Control": "no-store" });
         return;

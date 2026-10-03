@@ -44,8 +44,11 @@ function pic(p, opts = {}) {
 let bag = [];
 function loadBag() {
   try { bag = JSON.parse(localStorage.getItem("amethia-bag") || "[]"); } catch (e) { bag = []; }
-  bag = bag.filter(l => { const p = byId(l.id); return p && !p.soldOut && p.sizes.includes(l.size) && p.colors.some(c => c[0] === l.color); });
+  bag = bag.filter(l => { const p = byId(l.id); return p && !p.soldOut && p.sizes.includes(l.size) && sizeLeft(p, l.size) > 0 && p.colors.some(c => c[0] === l.color); });
 }
+// Pieces left in a size, or Infinity when the size is made to order. The server has the final say at checkout.
+const sizeLeft = (p, size) => p.soldOut ? 0 : size in p.stock ? p.stock[size] : Infinity;
+const maxQty = (p, size) => Math.min(10, sizeLeft(p, size));
 function saveBag() { try { localStorage.setItem("amethia-bag", JSON.stringify(bag)); } catch (e) {} updateCount(); }
 function updateCount() { $("#bagcount").textContent = bag.reduce((a, l) => a + l.qty, 0); }
 const subtotal = () => bag.reduce((a, l) => a + byId(l.id).price * l.qty, 0);
@@ -150,7 +153,8 @@ let pdp = { id: null, color: 0, size: null, qty: 1, view: 0, err: "" };
 function product(id) {
   const p = byId(id);
   if (!p) return `<div class="wrap empty" style="padding-block:120px"><p>We couldn't find that piece. It may have sold out.</p><a class="btn primary" href="#shop">Back to the shop</a></div>`;
-  if (pdp.id !== id) pdp = { id, color: 0, size: p.sizes.length === 1 ? p.sizes[0] : null, qty: 1, view: 0, err: "" };
+  if (pdp.id !== id) pdp = { id, color: 0, size: p.sizes.length === 1 && sizeLeft(p, p.sizes[0]) > 0 ? p.sizes[0] : null, qty: 1, view: 0, err: "" };
+  const left = pdp.size ? sizeLeft(p, pdp.size) : Infinity;
   const [cname] = p.colors[pdp.color];
   const ask = waLink(`Hi Amethia! I have a question about the ${p.name} (${cname}).`);
   const more = PRODUCTS.filter(x => x.id !== id).sort((a, b) => (b.category === p.category) - (a.category === p.category)).slice(0, 4);
@@ -176,8 +180,9 @@ function product(id) {
         </div>
         <div class="opt">
           <span class="optlabel">Size <b>${pdp.size || "Select a size"}</b></span>
-          <div class="sizes">${p.sizes.map(s => `<button class="sz" id="sz-${s.replace(/\s/g, "")}" data-action="size" data-s="${esc(s)}" aria-pressed="${pdp.size === s}" ${p.soldOut ? "disabled" : ""}>${esc(s)}</button>`).join("")}</div>
-          ${pdp.err ? `<p class="err" role="alert">${esc(pdp.err)}</p>` : ""}
+          <div class="sizes">${p.sizes.map(s => `<button class="sz" id="sz-${s.replace(/\s/g, "")}" data-action="size" data-s="${esc(s)}" aria-pressed="${pdp.size === s}" ${sizeLeft(p, s) > 0 ? "" : `disabled aria-label="${esc(s)}, sold out" title="Sold out"`}>${esc(s)}</button>`).join("")}</div>
+          ${!p.soldOut && left <= 3 ? `<p class="muted" style="margin:0;font-size:14px">Only ${left} left in this size.</p>` : ""}
+          ${pdp.err ?`<p class="err" role="alert">${esc(pdp.err)}</p>` : ""}
         </div>
         <div class="actions">
           ${p.soldOut ? `<button class="btn primary block" disabled>Sold out</button>` : `
@@ -436,16 +441,23 @@ document.addEventListener("click", async e => {
   if (a === "close-bag") closeBag();
   if (a === "view") { pdp.view = +t.dataset.v; rerenderKeepFocus(); }
   if (a === "color") { pdp.color = +t.dataset.i; rerenderKeepFocus(); }
-  if (a === "size") { pdp.size = t.dataset.s; pdp.err = ""; rerenderKeepFocus(); }
-  if (a === "pqty") { pdp.qty = Math.max(1, Math.min(10, pdp.qty + +t.dataset.d)); rerenderKeepFocus(); }
+  if (a === "size") { pdp.size = t.dataset.s; pdp.qty = Math.max(1, Math.min(pdp.qty, maxQty(byId(pdp.id), pdp.size))); pdp.err = ""; rerenderKeepFocus(); }
+  if (a === "pqty") { pdp.qty = Math.max(1, Math.min(pdp.size ? maxQty(byId(pdp.id), pdp.size) : 10, pdp.qty + +t.dataset.d)); rerenderKeepFocus(); }
   if (a === "add") {
     if (!pdp.size) { pdp.err = "Please choose a size first."; rerenderKeepFocus(); return; }
     const p = byId(pdp.id), color = p.colors[pdp.color][0];
+    // Stock is per size across all colours, so count what's already in the bag for this size.
+    const inBag = bag.filter(l => l.id === p.id && l.size === pdp.size).reduce((n, l) => n + l.qty, 0);
+    if (inBag + pdp.qty > sizeLeft(p, pdp.size)) { pdp.err = `Only ${sizeLeft(p, pdp.size)} left in this size, and ${inBag} ${inBag === 1 ? "is" : "are"} already in your bag.`; rerenderKeepFocus(); return; }
     const ex = bag.find(l => l.id === p.id && l.color === color && l.size === pdp.size);
     if (ex) ex.qty = Math.min(10, ex.qty + pdp.qty); else bag.push({ id: p.id, color, size: pdp.size, qty: pdp.qty });
     saveBag(); openBag();
   }
-  if (a === "lqty") { const l = bag[+t.dataset.i]; l.qty = Math.min(10, l.qty + +t.dataset.d); if (l.qty < 1) bag.splice(+t.dataset.i, 1); saveBag(); renderBag(); if (current === "checkout") render(true); }
+  if (a === "lqty") {
+    const l = bag[+t.dataset.i], p = byId(l.id);
+    const others = bag.filter(x => x !== l && x.id === l.id && x.size === l.size).reduce((n, x) => n + x.qty, 0);
+    l.qty = Math.min(10, sizeLeft(p, l.size) - others, l.qty + +t.dataset.d);
+    if (l.qty < 1) bag.splice(+t.dataset.i, 1); saveBag(); renderBag(); if (current === "checkout") render(true); }
   if (a === "remove") { bag.splice(+t.dataset.i, 1); saveBag(); renderBag(); if (current === "checkout") render(true); }
   if (a === "retry-pay") {
     t.disabled = true; t.textContent = "Opening PayHere…";
