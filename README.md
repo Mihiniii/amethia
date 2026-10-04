@@ -176,6 +176,7 @@ Server verifies signature + amount ──► Order marked "Paid" ✅
 Final-year Computer Science undergraduate, Uva Wellassa University of Sri Lanka
 
 [![GitHub](https://img.shields.io/badge/GitHub-Mihiniii-181717?style=flat&logo=github)](https://github.com/Mihiniii)
+[![LinkedIn](https://img.shields.io/badge/LinkedIn-Connect-0A66C2?style=flat&logo=linkedin)](https://linkedin.com/in/your-profile)
 
 ---
 
